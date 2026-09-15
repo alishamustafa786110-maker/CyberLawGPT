@@ -382,4 +382,3 @@ if user_input:
         "content": answer,
         "sources": retrieved if show_sources else None,
     })
-    })
