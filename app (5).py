@@ -21,6 +21,7 @@ embeds the chunks, and builds a FAISS index — all cached so it only happens on
 
 import os
 import io
+import re
 import time
 import requests
 import numpy as np
@@ -84,7 +85,11 @@ Rules you MUST follow:
    clearly separate "According to Pakistani law (PECA 2016)" from any general/comparative remarks.
 2. If the context does not contain enough information to answer confidently, say so plainly
    instead of guessing or inventing section numbers or penalties.
-3. Whenever possible, cite the relevant Section number(s) from the Act.
+3. Each context excerpt below is labeled with "[Detected Section(s): ...]" — this is a
+   best-effort automatic detection, not guaranteed complete. ONLY cite a section number if
+   it appears in one of these labels for the excerpt you are using. If an excerpt has no
+   detected section number, describe its content without inventing a number, e.g. say
+   "the Act states..." instead of attributing it to a specific, unconfirmed section.
 4. You are not a substitute for a licensed lawyer. For anything involving an active legal
    case, filing an FIR/complaint, or high-stakes decisions, remind the user to consult a
    qualified lawyer or the relevant authority (e.g. FIA Cyber Crime Wing / NR3C).
@@ -122,7 +127,29 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(pages_text)
 
 
+# Matches section headers as they typically appear in the Act, e.g. "3. Unauthorized
+# access to information system or data.—" or standalone mentions like "Section 21".
+SECTION_HEADER_RE = re.compile(r"(?m)^\s*(\d{1,3})\.\s+[A-Z]")
+SECTION_MENTION_RE = re.compile(r"\bSection\s+(\d{1,3})\b", re.IGNORECASE)
+
+
+def detect_section_numbers(text: str) -> list:
+    """Best-effort extraction of Act section numbers present in a piece of text.
+    Used to tag chunks so the model can only cite sections that actually appear
+    in the retrieved context, instead of guessing."""
+    found = set()
+    for m in SECTION_HEADER_RE.finditer(text):
+        num = int(m.group(1))
+        if 1 <= num <= 60:  # PECA 2016 has fewer than 60 sections; keeps false positives out
+            found.add(num)
+    for m in SECTION_MENTION_RE.finditer(text):
+        found.add(int(m.group(1)))
+    return sorted(found)
+
+
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE_WORDS, overlap: int = CHUNK_OVERLAP_WORDS):
+    """Splits text into overlapping word-chunks and tags each chunk with any
+    section numbers detected inside it, e.g. {"text": ..., "sections": [21, 22]}."""
     words = text.split()
     chunks = []
     start = 0
@@ -130,9 +157,11 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE_WORDS, overlap: int = CHU
         end = start + chunk_size
         chunk_words = words[start:end]
         if chunk_words:
-            chunks.append(" ".join(chunk_words))
+            chunk_str = " ".join(chunk_words)
+            if len(chunk_str.strip()) > 30:
+                chunks.append({"text": chunk_str, "sections": detect_section_numbers(chunk_str)})
         start += chunk_size - overlap
-    return [c for c in chunks if len(c.strip()) > 30]
+    return chunks
 
 
 @st.cache_resource(show_spinner=False)
@@ -149,7 +178,9 @@ def build_knowledge_base(pdf_url: str):
     chunks = chunk_text(raw_text)
 
     embedder = load_embedder()
-    embeddings = embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True)
+    embeddings = embedder.encode(
+        [c["text"] for c in chunks], show_progress_bar=False, normalize_embeddings=True
+    )
     embeddings = np.asarray(embeddings, dtype="float32")
 
     dim = embeddings.shape[1]
@@ -173,7 +204,8 @@ def retrieve(kb: dict, query: str, k: int = 4):
     for score, idx in zip(scores[0], idxs[0]):
         if idx == -1:
             continue
-        results.append({"text": kb["chunks"][idx], "score": float(score)})
+        chunk = kb["chunks"][idx]
+        results.append({"text": chunk["text"], "sections": chunk.get("sections", []), "score": float(score)})
     return results
 
 
@@ -266,7 +298,8 @@ try:
             chunks = chunk_text(raw_text)
             embedder = load_embedder()
             embeddings = np.asarray(
-                embedder.encode(chunks, show_progress_bar=False, normalize_embeddings=True), dtype="float32"
+                embedder.encode([c["text"] for c in chunks], show_progress_bar=False, normalize_embeddings=True),
+                dtype="float32",
             )
             index = faiss.IndexFlatIP(embeddings.shape[1])
             index.add(embeddings)
@@ -291,7 +324,8 @@ for msg in st.session_state.messages:
         if msg.get("sources"):
             with st.expander("📚 Retrieved sources"):
                 for i, s in enumerate(msg["sources"], 1):
-                    st.markdown(f"**Chunk {i}** (similarity: {s['score']:.2f})")
+                    sec_label = f"Section(s) {', '.join(str(x) for x in s['sections'])}" if s.get("sections") else "no section number detected"
+                    st.markdown(f"**Chunk {i}** · {sec_label} · similarity: {s['score']:.2f}")
                     st.caption(s["text"][:600] + ("..." if len(s["text"]) > 600 else ""))
 
 user_input = st.chat_input("Ask about Pakistan's cyber law, e.g. 'What is the penalty for hacking?'")
@@ -308,7 +342,10 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("Searching the Act and drafting a response..."):
             retrieved = retrieve(kb, user_input, k=top_k)
-            context_text = "\n\n---\n\n".join(r["text"] for r in retrieved)
+            context_text = "\n\n---\n\n".join(
+                f"[Detected Section(s): {', '.join(str(s) for s in r['sections']) or 'none detected'}]\n{r['text']}"
+                for r in retrieved
+            )
 
             system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
                 app_name=APP_NAME,
@@ -336,11 +373,13 @@ if user_input:
             if show_sources and retrieved:
                 with st.expander("📚 Retrieved sources"):
                     for i, s in enumerate(retrieved, 1):
-                        st.markdown(f"**Chunk {i}** (similarity: {s['score']:.2f})")
+                        sec_label = f"Section(s) {', '.join(str(x) for x in s['sections'])}" if s.get("sections") else "no section number detected"
+                        st.markdown(f"**Chunk {i}** · {sec_label} · similarity: {s['score']:.2f}")
                         st.caption(s["text"][:600] + ("..." if len(s["text"]) > 600 else ""))
 
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer,
         "sources": retrieved if show_sources else None,
+    })
     })
